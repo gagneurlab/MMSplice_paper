@@ -1,0 +1,156 @@
+"""
+Snakefile for the splicing model
+"""
+workdir:
+    "../../"
+ROOT = "../.."
+DATA = "data"
+
+from glob import glob
+from m_kipoi.config import list_models
+
+from glob import glob
+from m_kipoi.config import list_models
+from mmsplice.vcf_dataloader import SplicingVCFDataloader
+from mmsplice import MMSplice, predict_all_table
+MODELS = ["MaxEntScan", "HAL", "labranchor"]
+MODELS_FULL = list_models(MODELS)
+
+rule all:
+    input:
+        "data/raw/clinvar/clinvar_20180429.vcf.gz", # Download the vcf file
+        "data/processed/splicing/clinvar/clinvar_20180429.filtered.vcf.gz",  #filtered vcf
+        expand("data/processed/splicing/clinvar/annotated_vcf/clinvar_20180429.filtered/{model}.vcf",
+               model=MODELS_FULL),
+        "data/processed/splicing/clinvar/annotated_vcf/clinvar_20180429.filtered/modeling_df.tsv",
+        "data/raw/splicing/spidex/hg19_spidex.clinvar_20180429.txt",
+        "data/processed/splicing/clinvar/annotated_vcf/clinvar_20180429.filtered/mmsplice_pred.csv",
+        
+
+rule download_clinvar:
+    output:
+        vcf="data/raw/clinvar/{clinvar_file}.vcf.gz",
+        vcf_tbi="data/raw/clinvar/{clinvar_file}.vcf.gz.tbi",
+    shell:
+        """
+        wget ftp://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh37/archive_2.0/2018/{wildcards.clinvar_file}.vcf.gz -O {output.vcf}
+        wget ftp://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh37/archive_2.0/2018/{wildcards.clinvar_file}.vcf.gz.tbi -O {output.vcf_tbi}
+        """
+
+rule clinvar_donor_acceptor:
+    """Generate the annotation bed files"""
+    output:
+        acceptors = "data/processed/splicing/clinvar/acceptors.bed",
+        acceptors_num = "data/processed/splicing/clinvar/acceptors.numchr.bed",
+        donors = "data/processed/splicing/clinvar/donors.bed",
+        donors_num = "data/processed/splicing/clinvar/donors.numchr.bed"
+    script:
+        ROOT + "/experiments/splicing/generate_regions.R"
+
+rule filter_vcf:
+    input:
+        vcf="data/raw/clinvar/{clinvar_file}.vcf.gz",
+        acceptors_num = "data/processed/splicing/clinvar/acceptors.numchr.bed",
+        donors_num = "data/processed/splicing/clinvar/donors.numchr.bed",
+    output:
+        vcf="data/processed/splicing/clinvar/{clinvar_file}.filtered.vcf.gz",
+        vcf_tbi="data/processed/splicing/clinvar/{clinvar_file}.filtered.vcf.gz.tbi"
+    shell:
+        """
+        module load i12g/vcftools/0.1.14
+        vcftools --gzvcf {input.vcf} --recode --recode-INFO-all -c | \
+            awk '$5 != "."' | \
+            bedtools intersect -a stdin -b {input.acceptors_num} {input.donors_num} -wa -u -header | \
+            bgzip -c > {output.vcf}
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+        
+dl_kwargs = json.dumps({"gtf_file": os.path.abspath("data/raw/dataloader_files/shared/Homo_sapiens.GRCh37.75.filtered.gtf"),
+                        "fasta_file": os.path.abspath("data/raw/dataloader_files/shared/hg19.fa")})
+
+rule annotate_vcf:
+    """Annotate the Vcf using Kipoi's score variants
+    """
+    input:
+        vcf = "data/processed/splicing/clinvar/{clinvar_file}.filtered.vcf.gz",
+        gtf = "data/raw/dataloader_files/shared/Homo_sapiens.GRCh37.75.filtered.gtf",
+        fasta = "data/raw/dataloader_files/shared/hg19.fa"
+    output:
+        vcf = "data/processed/splicing/clinvar/annotated_vcf/{clinvar_file}.filtered/{model}.vcf"
+    params:
+        dl_kwargs=dl_kwargs,
+    shell:
+        """
+        mkdir -p `dirname {output.vcf}`
+        #source activate kipoi-var-effect
+        export CUDA_VISIBLE_DEVICES=1
+        kipoi veff score_variants {wildcards.model} \
+            --dataloader_args='{params.dl_kwargs}' \
+            -i $PWD/{input.vcf} \
+            -n 10 \
+            -o $PWD/{output.vcf} \
+            -s ref alt diff
+        """
+
+rule mmsplice_pred:
+    input:
+        vcf = "data/processed/splicing/clinvar/{clinvar_file}.filtered.vcf.gz"
+    output:
+        csv = "data/processed/splicing/clinvar/annotated_vcf/{clinvar_file}.filtered/mmsplice_pred.csv"
+    run:
+        fasta = "/s/genomes/human/hg19/ensembl_GRCh37.p13_release75/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa"
+        gtf = "/data/ouga/home/ag_gagneur/chengju/project/recods/Data/shared/Homo_sapiens.GRCh37.75.uniq_exon.gtf"
+        gtfIntervalTree = '/data/ouga/home/ag_gagneur/chengju/project/recods/Data/shared/ensembl75_dedup.pickle'
+        dl = SplicingVCFDataloader(gtfIntervalTree, #gtf
+                          fasta,
+                          input.vcf,
+                          gtf_db_path="/data/ouga/home/ag_gagneur/chengju/project/recods/Data/shared/ensembl75_dedup.db",
+                          out_file=gtfIntervalTree,
+                           split_seq=False,
+                           overhang=(50, 13))
+        model = MMSplice(
+            exon_cut_l=0,
+            exon_cut_r=0,
+            acceptor_intron_cut=6,
+            donor_intron_cut=6,
+            acceptor_intron_len=50,
+            acceptor_exon_len=3,
+            donor_exon_len=5,
+            donor_intron_len=13)
+        predictions = predict_all_table(model, dl, batch_size=1024, split_seq=False, assembly=False)
+        predictions.to_csv(output.csv)
+
+rule intersect_spidex:
+    """Filters the spidex index to speedup dataloading
+    """
+    input:
+        spidex="data/raw/splicing/spidex/hg19_spidex.txt",
+        vcf="data/processed/splicing/clinvar/{clinvar_file}.filtered.vcf.gz"
+    output:
+        spidex="data/raw/splicing/spidex/hg19_spidex.{clinvar_file}.txt"
+    shell:
+        """
+        bedtools intersect -a {input.spidex} -b {input.vcf} -header -sorted > {output.spidex}
+        """
+        
+rule gather:
+    """
+    VEP annotated file: http://grch37.ensembl.org/Homo_sapiens/Tools/VEP/Ticket?tl=4iJskr0Rc1jxAf43
+    """
+    input:
+        vcfs=expand("data/processed/splicing/clinvar/annotated_vcf/clinvar_20180429.filtered/{model}.vcf",
+               model=MODELS_FULL)
+    output:
+        tsv="data/processed/splicing/clinvar/annotated_vcf/{clinvar_file}.filtered/modeling_df.tsv"
+    threads:
+        16
+    run:
+        from m_kipoi.exp.splicing.gather import gather_vcfs
+        from m_kipoi.exp.splicing.data import get_dbscsnv_data
+        dfg = gather_vcfs(MODELS_FULL, 
+                          base_path="data/processed/splicing/clinvar/annotated_vcf/clinvar_20180429.filtered", 
+                          ncores=16)
+        # 
+        dfg.to_csv(output.tsv, sep='\t', index=False)
